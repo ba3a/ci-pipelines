@@ -1,0 +1,68 @@
+name: Gradle CI (reusable)
+
+# Builds and tests a Gradle project on every pull request, with a warm Gradle cache.
+# Called from a thin workflow in the project, see templates/gradle-ci.caller.yml.
+#
+# This is also the verification the AI Teammate relies on: the agent opens the pull request,
+# this workflow checks it, and a failure feeds the rework leg.
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: 'Java version the project builds with'
+        type: string
+        default: '21'
+      gradle_tasks:
+        description: 'Gradle tasks to run'
+        type: string
+        default: 'test detekt'
+      gradle_args:
+        description: 'Extra Gradle arguments'
+        type: string
+        default: '--console plain'
+
+permissions:
+  contents: read
+
+jobs:
+  gradle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: gradle-ci-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout the project
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Pull requests read the cache the default branch wrote and never write their own.
+          cache-read-only: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Run Gradle
+        env:
+          TASKS: ${{ inputs.gradle_tasks }}
+          ARGS: ${{ inputs.gradle_args }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew ${TASKS} ${ARGS}
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/reports/detekt/
+          if-no-files-found: ignore
+          retention-days: 7

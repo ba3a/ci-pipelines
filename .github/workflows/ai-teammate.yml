@@ -1,0 +1,308 @@
+name: AI Teammate (reusable)
+
+# Runs the DMTools "story development" agent for one GitHub issue of the CALLING repository:
+# reads the issue, implements it with the configured CLI agent and opens a pull request.
+#
+# Called from a thin workflow in the project, see templates/issue-teammate.caller.yml.
+# `github.*` in this file is the caller's context: github.repository is the project, not this
+# repository, and `actions/checkout` checks out the project.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: 'Number of the issue in the calling repository'
+        type: string
+        required: true
+      config_file:
+        description: 'Agent configuration, relative to the project root'
+        type: string
+        default: 'agents/story_development.json'
+      java_version:
+        description: 'Java version the project builds with (DMTools itself is built with 17)'
+        type: string
+        default: '21'
+      agent_provider:
+        description: 'AI_AGENT_PROVIDER of the dmtools-agents run-agent.sh script'
+        type: string
+        default: 'claude-code'
+      claude_base_url:
+        description: 'CLAUDE_CODE_BASE_URL (provider script requires it)'
+        type: string
+        default: 'https://api.anthropic.com'
+      claude_model:
+        description: 'CLAUDE_CODE_MODEL; empty keeps the provider script default'
+        type: string
+        default: ''
+      claude_max_turns:
+        description: 'CLAUDE_CODE_MAX_TURNS'
+        type: string
+        default: '60'
+      dmtools_release:
+        description: 'DMTools release installed by the agents setup script'
+        type: string
+        default: 'v1.7.243'
+      dmtools_fork_repo:
+        description: 'owner/repo to build DMTools from. Empty uses the release above.'
+        type: string
+        default: 'ba3a/dm.ai'
+      dmtools_fork_ref:
+        description: 'Branch of the fork to build'
+        type: string
+        default: 'main'
+      branch_naming_path:
+        description: 'Branch naming hook, relative to the project root. Empty keeps the default.'
+        type: string
+        default: '.dmtools/branchNaming.js'
+      agents_repo:
+        description: 'Used only when the project has no agents/ directory (no submodule)'
+        type: string
+        default: 'IstiN/dmtools-agents'
+      agents_ref:
+        description: 'Commit of the agents repository, used with agents_repo'
+        type: string
+        default: '15641a1e7bdcf35383cb07dae41a50e0f78a4d90'
+    secrets:
+      PAT_TOKEN:
+        description: 'Token that pushes branches and opens pull requests in the calling repository'
+        required: true
+      CLAUDE_CODE_API_KEY:
+        description: 'Anthropic API key for the claude-code provider'
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      COPILOT_GITHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  ai-teammate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: ai-teammate-${{ github.repository }}-${{ inputs.issue_number }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Validate inputs
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          if ! [[ "${ISSUE_NUMBER}" =~ ^[0-9]+$ ]]; then
+            echo "::error::issue_number must be numeric"
+            exit 1
+          fi
+
+      - name: Checkout the project
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          token: ${{ secrets.PAT_TOKEN }}
+          # Branch setup compares the working branch with origin/<base> (merge-base, rev-list,
+          # diff). A shallow clone cannot answer those.
+          fetch-depth: 0
+
+      # Projects that carry the agents as a submodule use it. Otherwise fetch the pinned agents
+      # next to the project and keep them out of the agent's commits.
+      - name: Checkout the agents (no submodule in the project)
+        if: hashFiles('agents/setup/install.sh') == ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.agents_repo }}
+          ref: ${{ inputs.agents_ref }}
+          path: agents
+
+      - name: Keep the agents out of commits
+        if: hashFiles('agents/setup/install.sh') != '' && hashFiles('.gitmodules') == ''
+        run: echo "agents/" >> .git/info/exclude
+
+      # The project's JDK, plus 17 which builds DMTools. The last version listed becomes the
+      # default JAVA_HOME.
+      - name: Set up Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: |
+            17
+            ${{ inputs.java_version }}
+
+      # Caches ~/.gradle (dependencies, wrapper, build cache) between runs.
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Configure npm global prefix
+        run: |
+          npm config set prefix ~/.npm-global
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Claude Code CLI
+        if: inputs.agent_provider == 'claude-code'
+        run: |
+          if ! command -v claude &> /dev/null; then
+            echo "Installing Claude Code CLI..."
+            npm install -g @anthropic-ai/claude-code
+          fi
+          claude --version
+
+      - name: Export tool cache keys
+        run: bash agents/setup/cache.sh keys dmtools:${{ inputs.dmtools_release }} codegraph
+
+      - name: Cache DMTools
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DMTOOLS_CACHE_PATH }}
+          key: ${{ env.DMTOOLS_CACHE_KEY }}
+          restore-keys: |
+            dmtools-
+
+      - name: Cache CodeGraph binary
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CODEGRAPH_CACHE_PATH }}
+          key: ${{ env.CODEGRAPH_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-npm-global-codegraph-
+            ${{ runner.os }}-npm-global-
+
+      - name: Cache CodeGraph index
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CODEGRAPH_INDEX_CACHE_PATH }}
+          key: ${{ env.CODEGRAPH_INDEX_CACHE_KEY }}-${{ github.sha }}
+          restore-keys: |
+            ${{ env.CODEGRAPH_INDEX_CACHE_KEY }}-${{ github.ref_name }}-
+            ${{ env.CODEGRAPH_INDEX_CACHE_KEY }}-
+
+      - name: Install DMTools ${{ inputs.dmtools_release }}
+        run: bash agents/setup/install.sh dmtools:${{ inputs.dmtools_release }}
+
+      # No DMTools release has the GitHub Issues tracker yet, so run a jar built from a fork.
+      # The jar is cached by the revision of the fork. Set dmtools_fork_repo to '' once a
+      # release contains the tracker.
+      - name: Resolve DMTools fork revision
+        if: inputs.dmtools_fork_repo != ''
+        id: dmtools-fork
+        env:
+          FORK_REPO: ${{ inputs.dmtools_fork_repo }}
+          FORK_REF: ${{ inputs.dmtools_fork_ref }}
+        run: |
+          sha="$(git ls-remote "https://github.com/${FORK_REPO}.git" "refs/heads/${FORK_REF}" | cut -f1)"
+          if [ -z "${sha}" ]; then
+            echo "::error::Cannot resolve ${FORK_REPO}@${FORK_REF}"
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache DMTools fork jar
+        if: inputs.dmtools_fork_repo != ''
+        id: dmtools-fork-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.dmtools-fork
+          key: dmtools-fork-${{ steps.dmtools-fork.outputs.sha }}
+
+      - name: Build DMTools from the fork
+        if: inputs.dmtools_fork_repo != '' && steps.dmtools-fork-cache.outputs.cache-hit != 'true'
+        env:
+          FORK_REPO: ${{ inputs.dmtools_fork_repo }}
+          FORK_SHA: ${{ steps.dmtools-fork.outputs.sha }}
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64}"
+          src="${RUNNER_TEMP}/dmtools-src"
+          git clone --depth 1 "https://github.com/${FORK_REPO}.git" "${src}"
+          git -C "${src}" fetch --depth 1 origin "${FORK_SHA}"
+          git -C "${src}" checkout --quiet "${FORK_SHA}"
+          (cd "${src}" && ./gradlew :dmtools-core:shadowJar -x test --no-daemon)
+          mkdir -p ~/.dmtools-fork
+          cp "${src}"/build/libs/dmtools-v*-all.jar ~/.dmtools-fork/dmtools.jar
+
+      - name: Install the DMTools fork jar
+        if: inputs.dmtools_fork_repo != ''
+        run: |
+          mkdir -p ~/.dmtools
+          cp ~/.dmtools-fork/dmtools.jar ~/.dmtools/dmtools.jar
+
+      - name: Install and init CodeGraph
+        run: bash agents/setup/codegraph.sh
+
+      - name: Configure Git Author
+        run: |
+          git config --global user.name "dm.ai"
+          git config --global user.email "dm.ai@epam.com"
+
+      # Headless `claude -p` denies file writes and shell redirection unless a permission mode
+      # allows them, and the provider script's `--allowedTools all` matches no tool. The other
+      # providers run with full permissions (cursor --force, copilot --allow-all, codemie
+      # --dangerously-skip-permissions); do the same here. The runner is ephemeral, so scope
+      # PAT_TOKEN to the calling repository and rely on branch protection for what the agent
+      # may merge.
+      - name: Configure Claude Code permissions
+        if: inputs.agent_provider == 'claude-code'
+        run: |
+          mkdir -p ~/.claude
+          echo '{"permissions":{"defaultMode":"bypassPermissions"}}' > ~/.claude/settings.json
+
+      - name: Build the agent configuration
+        id: config
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          BRANCH_NAMING: ${{ inputs.branch_naming_path }}
+        run: |
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          # targetRepository: the agents read the repository from the project's .dmtools config,
+          # which may name another repository (a fork of it, for instance). The typed job
+          # parameters drop an unknown top-level key, customParams reach the scripts unchanged.
+          # branchNamingFnPath: the default branch name embeds the composite issue key, which
+          # contains '#' and is rejected by the agents' ref-name guard.
+          encoded="$(jq -cn \
+            --arg jql "${GITHUB_REPOSITORY}#${ISSUE_NUMBER}" \
+            --arg owner "${owner}" --arg repo "${repo}" --arg naming "${BRANCH_NAMING}" \
+            '{params: {inputJql: $jql, customParams: ({targetRepository: {owner: $owner, repo: $repo}}
+               + (if $naming == "" then {} else {branchNamingFnPath: $naming} end))}}')"
+          echo "encoded=${encoded}" >> "$GITHUB_OUTPUT"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Run AI Teammate
+        env:
+          PATH: "/home/runner/.local/bin:/home/runner/.dmtools/bin:/home/runner/.npm-global/bin:/bin:/usr/bin:$PATH"
+
+          # GitHub
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SOURCE_GITHUB_WORKSPACE: ${{ steps.config.outputs.owner }}
+          SOURCE_GITHUB_REPOSITORY: ${{ steps.config.outputs.repo }}
+
+          # AI providers
+          AI_AGENT_PROVIDER: ${{ inputs.agent_provider }}
+          CLAUDE_CODE_API_KEY: ${{ secrets.CLAUDE_CODE_API_KEY }}
+          CLAUDE_CODE_BASE_URL: ${{ inputs.claude_base_url }}
+          CLAUDE_CODE_MODEL: ${{ inputs.claude_model }}
+          CLAUDE_CODE_MAX_TURNS: ${{ inputs.claude_max_turns }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN || secrets.PAT_TOKEN }}
+
+          # DMTools
+          DMTOOLS_INTEGRATIONS: "ai,cli,file,github"
+          DEFAULT_TRACKER: "github"
+          CLI_ALLOWED_COMMANDS: "find,ls,cat,mkdir,bash"
+          ENCODED_CONFIG: ${{ steps.config.outputs.encoded }}
+          CONFIG_FILE: ${{ inputs.config_file }}
+        run: |
+          CI_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "Configuration: ${CONFIG_FILE}"
+          echo "CI run: ${CI_RUN_URL}"
+          dmtools --debug run "${CONFIG_FILE}" "${ENCODED_CONFIG}" --ciRunUrl "${CI_RUN_URL}"
