@@ -42,7 +42,7 @@ on:
         type: string
         default: >-
           reconcile-rework-vs-approval,reconcile-issue-rework-vs-approval,reconcile-approval-vs-changes,
-          unarm-stale-validation,fail-validation,sweep-stale-validating,silent-update-behind,
+          unarm-stale-validation,fail-validation,sweep-stale-validating,
           revalidate-armed,revalidate-armed-green,validate-fresh,validate-fresh-masked-green,validated-green,
           conflict-rework,rework-on-red-ci,rework-on-label,rework-arm-restore,
           develop-done,review-after-dev,review-stale-verdict,review-threads-resolved,
@@ -209,6 +209,40 @@ jobs:
               | map(if has("workflowFile") then .workflowFile = $wf else . end))' \
             agents/sm_github.json > agents/sm_selected.json
           echo "rules: $(jq -r '[.params.jobParams.rules[].id] | join(", ")' agents/sm_selected.json)"
+
+      # Replaces the rule silent-update-behind. That rule clones and merges with one shell command
+      # that DMTools on Java refuses (it contains && and ${...}) and that assumes the base branch
+      # is main. A pull request that is behind its base would never reach validation, because the
+      # validation rules skip it, so update the branches here. The push uses the PAT, so CI runs on
+      # the new head like on any push. A pull request that is validating keeps its head, and one
+      # with conflicts is left to the rule conflict-rework.
+      - name: Update branches that are behind
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MACHINE_AUTHOR: ${{ inputs.machine_author }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "${GITHUB_REPOSITORY}" --state open --limit 100 \
+              --json number,isDraft,isCrossRepository,baseRefName,headRefName,author,labels \
+            | jq -r --arg authors "${MACHINE_AUTHOR}" '
+                .[]
+                | select((.isDraft | not) and (.isCrossRepository | not)
+                    and (.author.login as $login | $authors | split(",") | index($login))
+                    and (([.labels[].name] | index("ai_validating")) | not))
+                | "\(.number) \(.baseRefName) \(.headRefName)"' \
+            | while read -r number base head; do
+                behind="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}" --jq .behind_by)"
+                if [ "${behind}" -eq 0 ]; then
+                  echo "PR #${number}: up to date with ${base}"
+                elif [ "${DRY_RUN}" = "true" ]; then
+                  echo "PR #${number}: ${behind} commit(s) behind ${base}, would update (dry run)"
+                elif gh pr update-branch "${number}" --repo "${GITHUB_REPOSITORY}"; then
+                  echo "PR #${number}: updated from ${base}, ${behind} commit(s) behind"
+                else
+                  echo "::warning::PR #${number} is ${behind} commit(s) behind ${base} and cannot be updated, probably a conflict"
+                fi
+              done
 
       - name: Reconcile the machine loop
         env:

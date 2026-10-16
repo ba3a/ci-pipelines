@@ -54,6 +54,9 @@ label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_appro
   `agent:rework` or `agent:review` on any pull request to ask for a leg by hand.
 - **Ticks** run after `CI` and `Issue Teammate` runs and every 30 minutes. Dispatch
   `machine-sm.yml` by hand with *dry run* on (the default) to read the plan without any effect.
+- **Branches that are behind** are updated by a step of `sm.yml` (`gh pr update-branch` with the
+  PAT), not by the upstream rule `silent-update-behind`: that rule runs a shell command DMTools on
+  Java refuses and assumes the base branch is `main`.
 - **CI must be dispatchable.** The tick starts CI on a pull request head itself, so the project's
   `ci.yml` has a `workflow_dispatch` trigger (the template has it).
 - **Rework limits.** The agent rules cap rework by red heads; there is no other cost cap. Watch
