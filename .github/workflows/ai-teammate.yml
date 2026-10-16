@@ -2,13 +2,16 @@ name: AI Teammate (reusable)
 
 # Runs one leg of the DMTools machine loop for a GitHub issue of the CALLING repository:
 #
+#   plan    reads the issue and either keeps it whole (and starts the dev leg) or splits it into
+#           ordered sub-issues that are developed one at a time
 #   dev     reads the issue, implements it with the configured CLI agent and opens a pull request
 #   review  reviews the pull request of the issue and records a verdict (labels, comments)
 #   rework  fixes the pull request: review findings, red CI and merge conflicts
 #
-# A person starts the dev leg by labelling an issue. The review and rework legs are started by
-# the state machine, see sm.yml. It dispatches the caller workflow with the leg and either the
-# issue or, for a pull request that has no issue to name, the pull request.
+# A person starts the plan or the dev leg by labelling an issue. The state machine (sm.yml)
+# starts the rest: each planned sub-issue in turn, and the review and rework legs. It dispatches
+# the caller workflow with the leg and either the issue or, for a pull request that has no issue
+# to name, the pull request.
 #
 # Called from a thin workflow in the project, see templates/issue-teammate.caller.yml.
 # `github.*` in this file is the caller's context: github.repository is the project, not this
@@ -26,7 +29,7 @@ on:
         type: string
         default: ''
       leg:
-        description: 'dev, review or rework. Selects the agent configuration unless config_file is set.'
+        description: 'plan, dev, review or rework. Selects the agent configuration unless config_file is set.'
         type: string
         default: 'dev'
       config_file:
@@ -116,11 +119,12 @@ jobs:
           set -euo pipefail
           if [ -z "${CONFIG_FILE}" ]; then
             case "${LEG}" in
+              plan) CONFIG_FILE=agents/issue_planning.json ;;
               dev) CONFIG_FILE=agents/story_development.json ;;
               review) CONFIG_FILE=agents/pr_review.json ;;
               rework) CONFIG_FILE=agents/pr_rework.json ;;
               *)
-                echo "::error::leg must be dev, review or rework, got '${LEG}'"
+                echo "::error::leg must be plan, dev, review or rework, got '${LEG}'"
                 exit 1
                 ;;
             esac

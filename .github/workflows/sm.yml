@@ -5,8 +5,10 @@ name: Machine SM (reusable)
 # One tick reads the state of the calling repository (issue and pull request labels, CI results,
 # merge state) and starts whatever step that state calls for. It uses the deterministic rule
 # engine of dmtools-agents (agents/sm_github.json): no AI model runs in a tick. A rule that needs
-# an agent dispatches the caller's issue-teammate workflow with a leg (review or rework). Ticks
-# are cheap, so run them often.
+# an agent dispatches the caller's issue-teammate workflow with a leg (review or rework). The rule
+# plan-advance starts the sub-issues of a planned issue one at a time, by adding the dev label
+# (issuePlanning.devLabel in the project's .dmtools/config.js) to the next one. Ticks are cheap,
+# so run them often.
 #
 # This pipeline never merges. The rules that merge or prepare a merge are not in the default
 # `sm_rules`; the pull request waits for you with the label pr_approved.
@@ -46,7 +48,8 @@ on:
           revalidate-armed,revalidate-armed-green,validate-fresh,validate-fresh-masked-green,validated-green,
           conflict-rework,rework-on-red-ci,rework-on-label,rework-arm-restore,
           develop-done,review-after-dev,review-stale-verdict,review-threads-resolved,
-          review-stale-verdict-unchecked,rework-unresolved-threads,review-on-label,close-on-merge
+          review-stale-verdict-unchecked,rework-unresolved-threads,review-on-label,close-on-merge,
+          plan-advance
       dmtools_release:
         description: 'DMTools release installed by the agents setup script'
         type: string

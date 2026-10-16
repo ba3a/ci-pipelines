@@ -24,11 +24,17 @@ repos.conf          the projects and their parameters
    `.github/workflows/issue-teammate.yml`, `ci.yml` and, when `repos.conf` names a machine author,
    `machine-sm.yml`; open and merge that pull request.
 2. Set the secrets `PAT_TOKEN` and `CLAUDE_CODE_API_KEY` (`scripts/set-secrets.sh`, or by hand).
-3. Enable Issues and Actions, create the label `dmtools:develop`.
+3. Enable Issues and Actions, create the labels `dmtools:plan` and `dmtools:develop`.
 4. Put the project-specific part next to the code: `.dmtools/config.js` (base branch,
-   repository) and `.dmtools/prompts/*.md` (what the agent must know about this project).
+   repository) and `.dmtools/prompts/*.md` (what the agent must know about this project). With the
+   state machine on, also set the label that starts development, so planned sub-issues start the
+   same way: `issuePlanning: { devLabel: 'dmtools:develop' }`.
 
-Adding the label `dmtools:develop` to an issue now runs the agent on that issue.
+Label an issue to start the agent on it:
+
+- `dmtools:plan` (the default way): the agent plans first. A small issue is kept whole and
+  developed; a big one is split into ordered sub-issues, developed one at a time (see below).
+- `dmtools:develop`: the agent develops the issue directly, without planning.
 
 ## The state machine
 
@@ -37,10 +43,20 @@ engine `agents/sm_github.json` runs on a tick and starts the next step from the 
 and merge state of the issues and pull requests. No AI model runs in a tick.
 
 ```
+label dmtools:plan -> plan leg -> kept whole -> label dmtools:develop on the issue
+                               -> split      -> sub-issues 1..N; the tick labels the next one
+                                                dmtools:develop when the previous one is closed
+
 label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_approved -> you merge
                                         ^              |
                                         +-- rework leg <-+  review findings, red CI, merge conflicts
 ```
+
+- **Planning** is the `issue_planning` agent of dmtools-agents. A split issue gets the label
+  `ai_planned` and a comment with the ordered steps; each step is a sub-issue whose description
+  links the parent. The rule `plan-advance` starts one step at a time, in order, and closes the
+  parent when every step is closed. Steps run sequentially: each one waits for you to merge the
+  previous one.
 
 - **Legs** are runs of the project's `issue-teammate.yml` (`ai-teammate.yml` here). The tick
   dispatches it with `leg` = `review` or `rework` and the issue or the pull request. A pull
