@@ -9,6 +9,8 @@
 #   PIPELINES_REF   tag or branch of ba3a/ci-pipelines the callers pin to (default: v1)
 #   SYNC_BRANCH     branch created in the projects (default: ci/sync-pipelines)
 #
+# A project whose repos.conf line has a machine author also gets machine-sm.yml, the state machine.
+#
 # Needs git with credentials that can push to the projects. --dry-run renders into ./out.
 set -euo pipefail
 
@@ -26,13 +28,14 @@ for arg in "$@"; do
 done
 
 render() {
-  # render <template> <destination> <base> <java> <turns> <tasks>
+  # render <template> <destination> <base> <java> <turns> <tasks> <machine_author>
   sed \
     -e "s|__PIPELINES_REF__|${ref}|g" \
     -e "s|__BASE_BRANCH__|$3|g" \
     -e "s|__JAVA_VERSION__|$4|g" \
     -e "s|__MAX_TURNS__|$5|g" \
     -e "s|__GRADLE_TASKS__|${6//,/ }|g" \
+    -e "s|__MACHINE_AUTHOR__|$7|g" \
     "$1" > "$2"
 }
 
@@ -43,7 +46,7 @@ wanted() {
   return 1
 }
 
-while read -r repo base java turns tasks _; do
+while read -r repo base java turns tasks author _; do
   case "${repo}" in ''|'#'*) continue ;; esac
   wanted "${repo}" || continue
   echo "==> ${repo}"
@@ -60,9 +63,14 @@ while read -r repo base java turns tasks _; do
   fi
 
   render "${root}/templates/issue-teammate.caller.yml" "${dest}/.github/workflows/issue-teammate.yml" \
-    "${base}" "${java}" "${turns}" "${tasks}"
+    "${base}" "${java}" "${turns}" "${tasks}" "${author}"
   render "${root}/templates/gradle-ci.caller.yml" "${dest}/.github/workflows/ci.yml" \
-    "${base}" "${java}" "${turns}" "${tasks}"
+    "${base}" "${java}" "${turns}" "${tasks}" "${author}"
+  # A project with a machine author runs the state machine; "-" leaves it out.
+  if [ -n "${author}" ] && [ "${author}" != "-" ]; then
+    render "${root}/templates/machine-sm.caller.yml" "${dest}/.github/workflows/machine-sm.yml" \
+      "${base}" "${java}" "${turns}" "${tasks}" "${author}"
+  fi
 
   # The pre-pipeline copies of the workflows are replaced by the callers.
   if ! "${dry_run}"; then

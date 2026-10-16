@@ -1,7 +1,14 @@
 name: AI Teammate (reusable)
 
-# Runs the DMTools "story development" agent for one GitHub issue of the CALLING repository:
-# reads the issue, implements it with the configured CLI agent and opens a pull request.
+# Runs one leg of the DMTools machine loop for a GitHub issue of the CALLING repository:
+#
+#   dev     reads the issue, implements it with the configured CLI agent and opens a pull request
+#   review  reviews the pull request of the issue and records a verdict (labels, comments)
+#   rework  fixes the pull request: review findings, red CI and merge conflicts
+#
+# A person starts the dev leg by labelling an issue. The review and rework legs are started by
+# the state machine, see sm.yml. It dispatches the caller workflow with the leg and either the
+# issue or, for a pull request that has no issue to name, the pull request.
 #
 # Called from a thin workflow in the project, see templates/issue-teammate.caller.yml.
 # `github.*` in this file is the caller's context: github.repository is the project, not this
@@ -11,13 +18,21 @@ on:
   workflow_call:
     inputs:
       issue_number:
-        description: 'Number of the issue in the calling repository'
+        description: 'Number of the issue in the calling repository. May be empty when pr_number is set.'
         type: string
-        required: true
+        default: ''
+      pr_number:
+        description: 'Number of a pull request. The issue it closes is resolved from its body or its ai/gh-N branch.'
+        type: string
+        default: ''
+      leg:
+        description: 'dev, review or rework. Selects the agent configuration unless config_file is set.'
+        type: string
+        default: 'dev'
       config_file:
-        description: 'Agent configuration, relative to the project root'
+        description: 'Agent configuration, relative to the project root. Empty derives it from leg.'
         type: string
-        default: 'agents/story_development.json'
+        default: ''
       java_version:
         description: 'Java version the project builds with (DMTools itself is built with 17)'
         type: string
@@ -82,18 +97,55 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     concurrency:
-      group: ai-teammate-${{ github.repository }}-${{ inputs.issue_number }}
+      group: ai-teammate-${{ github.repository }}-${{ inputs.issue_number || format('pr-{0}', inputs.pr_number) }}
       cancel-in-progress: false
 
     steps:
-      - name: Validate inputs
+      # Chooses the agent configuration for the leg and the issue the agent works on. A leg that
+      # the state machine starts for a pull request has no issue number, so the issue is read
+      # from the pull request: "Closes #N" in the body, else the ai/gh-N branch the dev leg made.
+      - name: Resolve the run
+        id: run
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          LEG: ${{ inputs.leg }}
+          CONFIG_FILE: ${{ inputs.config_file }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
+          if [ -z "${CONFIG_FILE}" ]; then
+            case "${LEG}" in
+              dev) CONFIG_FILE=agents/story_development.json ;;
+              review) CONFIG_FILE=agents/pr_review.json ;;
+              rework) CONFIG_FILE=agents/pr_rework.json ;;
+              *)
+                echo "::error::leg must be dev, review or rework, got '${LEG}'"
+                exit 1
+                ;;
+            esac
+          fi
+          if [ -z "${ISSUE_NUMBER}" ] && [ -n "${PR_NUMBER}" ]; then
+            if ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+              echo "::error::pr_number must be numeric"
+              exit 1
+            fi
+            pr="$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json body,headRefName)"
+            ISSUE_NUMBER="$(jq -r '.body // ""' <<<"${pr}" \
+              | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) +#[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true)"
+            if [ -z "${ISSUE_NUMBER}" ]; then
+              ISSUE_NUMBER="$(jq -r '.headRefName' <<<"${pr}" | sed -nE 's#^ai/gh-([0-9]+).*#\1#p')"
+            fi
+          fi
           if ! [[ "${ISSUE_NUMBER}" =~ ^[0-9]+$ ]]; then
-            echo "::error::issue_number must be numeric"
+            echo "::error::No issue to work on: issue_number is empty and pull request '${PR_NUMBER}' names none"
             exit 1
           fi
+          echo "leg=${LEG}, issue #${ISSUE_NUMBER}, configuration ${CONFIG_FILE}"
+          {
+            echo "issue=${ISSUE_NUMBER}"
+            echo "config=${CONFIG_FILE}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout the project
         uses: actions/checkout@v7
@@ -255,7 +307,7 @@ jobs:
       - name: Build the agent configuration
         id: config
         env:
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          ISSUE_NUMBER: ${{ steps.run.outputs.issue }}
           BRANCH_NAMING: ${{ inputs.branch_naming_path }}
         run: |
           owner="${GITHUB_REPOSITORY%%/*}"
@@ -300,7 +352,7 @@ jobs:
           DEFAULT_TRACKER: "github"
           CLI_ALLOWED_COMMANDS: "find,ls,cat,mkdir,bash"
           ENCODED_CONFIG: ${{ steps.config.outputs.encoded }}
-          CONFIG_FILE: ${{ inputs.config_file }}
+          CONFIG_FILE: ${{ steps.run.outputs.config }}
         run: |
           CI_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "Configuration: ${CONFIG_FILE}"

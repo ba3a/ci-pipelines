@@ -7,7 +7,8 @@ workflows; the logic lives here as [reusable workflows](https://docs.github.com/
 
 ```
 .github/workflows/
-  ai-teammate.yml   reusable: issue -> agent -> pull request (DMTools + dmtools-agents)
+  ai-teammate.yml   reusable: one leg of the machine loop (dev, review or rework) for an issue
+  sm.yml            reusable: the state machine tick that starts the review and rework legs
   gradle-ci.yml     reusable: build and test a Gradle project
   self-test.yml     actionlint and shellcheck for this repository
 templates/          the caller workflows written into each project
@@ -20,13 +21,43 @@ repos.conf          the projects and their parameters
 ## Using it from a project
 
 1. Run `scripts/sync.sh owner/repo`. It pushes the branch `ci/sync-pipelines` with
-   `.github/workflows/issue-teammate.yml` and `ci.yml`; open and merge that pull request.
+   `.github/workflows/issue-teammate.yml`, `ci.yml` and, when `repos.conf` names a machine author,
+   `machine-sm.yml`; open and merge that pull request.
 2. Set the secrets `PAT_TOKEN` and `CLAUDE_CODE_API_KEY` (`scripts/set-secrets.sh`, or by hand).
 3. Enable Issues and Actions, create the label `dmtools:develop`.
 4. Put the project-specific part next to the code: `.dmtools/config.js` (base branch,
    repository) and `.dmtools/prompts/*.md` (what the agent must know about this project).
 
 Adding the label `dmtools:develop` to an issue now runs the agent on that issue.
+
+## The state machine
+
+`sm.yml` is the machine loop of [dmtools-agents](https://github.com/IstiN/dmtools-agents): its rule
+engine `agents/sm_github.json` runs on a tick and starts the next step from the labels, CI results
+and merge state of the issues and pull requests. No AI model runs in a tick.
+
+```
+label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_approved -> you merge
+                                        ^              |
+                                        +-- rework leg <-+  review findings, red CI, merge conflicts
+```
+
+- **Legs** are runs of the project's `issue-teammate.yml` (`ai-teammate.yml` here). The tick
+  dispatches it with `leg` = `review` or `rework` and the issue or the pull request. A pull
+  request without an issue is resolved to its issue from "Closes #N" or the `ai/gh-N` branch.
+- **No merge.** `sm_rules` in `sm.yml` lists the rules that run, and the rules that merge are not
+  in it. The pull request waits for you with the label `pr_approved`; the rule `close-on-merge`
+  closes the issue after you merge. `merge-validated` and `validate-armed` are the upstream merge
+  rules; they are left out on purpose and untested here.
+- **Only the machine author's pull requests** get automatic review and rework, those opened by
+  the login in the `machine_author` column of `repos.conf` (the owner of `PAT_TOKEN`). Put the label
+  `agent:rework` or `agent:review` on any pull request to ask for a leg by hand.
+- **Ticks** run after `CI` and `Issue Teammate` runs and every 30 minutes. Dispatch
+  `machine-sm.yml` by hand with *dry run* on (the default) to read the plan without any effect.
+- **CI must be dispatchable.** The tick starts CI on a pull request head itself, so the project's
+  `ci.yml` has a `workflow_dispatch` trigger (the template has it).
+- **Rework limits.** The agent rules cap rework by red heads; there is no other cost cap. Watch
+  the first runs.
 
 ## One-time setup of this repository
 
@@ -53,5 +84,7 @@ Adding the label `dmtools:develop` to an issue now runs the agent on that issue.
 
 ## Status
 
-Written, not yet run. The first run of `ai-teammate.yml` as a reusable workflow, and the
-`agents` checkout used when a project has no submodule, are untested.
+`ai-teammate.yml` has run once as a reusable workflow, for the dev leg. Not yet run: the `review`
+and `rework` legs, the `agents` checkout used when a project has no submodule, and `sm.yml`. Run
+`machine-sm.yml` as a dry run first. The rule engine was written for the Dart runtime of DMTools;
+whether the Java fork jar runs every rule is untested.

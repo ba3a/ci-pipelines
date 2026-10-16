@@ -1,0 +1,245 @@
+name: Machine SM (reusable)
+
+# The state machine of the machine loop: issue -> pull request -> CI -> review -> rework -> you merge.
+#
+# One tick reads the state of the calling repository (issue and pull request labels, CI results,
+# merge state) and starts whatever step that state calls for. It uses the deterministic rule
+# engine of dmtools-agents (agents/sm_github.json): no AI model runs in a tick. A rule that needs
+# an agent dispatches the caller's issue-teammate workflow with a leg (review or rework). Ticks
+# are cheap, so run them often.
+#
+# This pipeline never merges. The rules that merge or prepare a merge are not in the default
+# `sm_rules`; the pull request waits for you with the label pr_approved.
+#
+# Called from a thin workflow in the project, see templates/machine-sm.caller.yml.
+# `github.*` in this file is the caller's context, like in ai-teammate.yml.
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: "'true' logs the plan and acts on nothing. A string: reusable workflows cannot take expressions in boolean inputs."
+        type: string
+        default: 'false'
+      machine_author:
+        description: 'Login(s) that author the pull requests of the agent, comma separated. Only their pull requests get automatic review and rework.'
+        type: string
+        required: true
+      workflow_file:
+        description: 'The caller workflow the SM dispatches to run a leg'
+        type: string
+        default: 'issue-teammate.yml'
+      ci_workflow:
+        description: 'The caller workflow the SM dispatches to validate a pull request head. It needs a workflow_dispatch trigger.'
+        type: string
+        default: 'ci.yml'
+      max_triggered_workflows:
+        description: 'Most legs the SM runs at the same time'
+        type: string
+        default: '2'
+      sm_rules:
+        description: 'Ids of the rules of agents/sm_github.json to run, comma separated. Their order in that file is kept.'
+        type: string
+        default: >-
+          reconcile-rework-vs-approval,reconcile-issue-rework-vs-approval,reconcile-approval-vs-changes,
+          unarm-stale-validation,fail-validation,sweep-stale-validating,silent-update-behind,
+          revalidate-armed,revalidate-armed-green,validate-fresh,validate-fresh-masked-green,validated-green,
+          conflict-rework,rework-on-red-ci,rework-on-label,rework-arm-restore,
+          develop-done,review-after-dev,review-stale-verdict,review-threads-resolved,
+          review-stale-verdict-unchecked,rework-unresolved-threads,review-on-label,close-on-merge
+      dmtools_release:
+        description: 'DMTools release installed by the agents setup script'
+        type: string
+        default: 'v1.7.243'
+      dmtools_fork_repo:
+        description: 'owner/repo to build DMTools from. Empty uses the release above.'
+        type: string
+        default: 'ba3a/dm.ai'
+      dmtools_fork_ref:
+        description: 'Branch of the fork to build'
+        type: string
+        default: 'main'
+      agents_repo:
+        description: 'Used only when the project has no agents/ directory (no submodule)'
+        type: string
+        default: 'IstiN/dmtools-agents'
+      agents_ref:
+        description: 'Commit of the agents repository, used with agents_repo'
+        type: string
+        default: '15641a1e7bdcf35383cb07dae41a50e0f78a4d90'
+    secrets:
+      PAT_TOKEN:
+        description: 'Token that labels, dispatches and comments in the calling repository'
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  checks: write
+
+jobs:
+  sm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # One tick at a time. A tick that waits behind a running one is replaced by a newer one.
+    concurrency:
+      group: machine-sm-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout the project
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          token: ${{ secrets.PAT_TOKEN }}
+          # Updating a pull request branch merges the base branch, which needs the history.
+          fetch-depth: 0
+
+      - name: Checkout the agents (no submodule in the project)
+        if: hashFiles('agents/setup/install.sh') == ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.agents_repo }}
+          ref: ${{ inputs.agents_ref }}
+          path: agents
+
+      - name: Keep the agents out of commits
+        if: hashFiles('agents/setup/install.sh') != '' && hashFiles('.gitmodules') == ''
+        run: echo "agents/" >> .git/info/exclude
+
+      # DMTools is built with 17 and runs on it.
+      - name: Set up Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configure npm global prefix
+        run: |
+          npm config set prefix ~/.npm-global
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Export tool cache keys
+        run: bash agents/setup/cache.sh keys dmtools:${{ inputs.dmtools_release }}
+
+      - name: Cache DMTools
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DMTOOLS_CACHE_PATH }}
+          key: ${{ env.DMTOOLS_CACHE_KEY }}
+          restore-keys: |
+            dmtools-
+
+      - name: Install DMTools ${{ inputs.dmtools_release }}
+        run: bash agents/setup/install.sh dmtools:${{ inputs.dmtools_release }}
+
+      # Same fork jar as ai-teammate.yml: no DMTools release has the GitHub Issues tracker yet.
+      - name: Resolve DMTools fork revision
+        if: inputs.dmtools_fork_repo != ''
+        id: dmtools-fork
+        env:
+          FORK_REPO: ${{ inputs.dmtools_fork_repo }}
+          FORK_REF: ${{ inputs.dmtools_fork_ref }}
+        run: |
+          sha="$(git ls-remote "https://github.com/${FORK_REPO}.git" "refs/heads/${FORK_REF}" | cut -f1)"
+          if [ -z "${sha}" ]; then
+            echo "::error::Cannot resolve ${FORK_REPO}@${FORK_REF}"
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache DMTools fork jar
+        if: inputs.dmtools_fork_repo != ''
+        id: dmtools-fork-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.dmtools-fork
+          key: dmtools-fork-${{ steps.dmtools-fork.outputs.sha }}
+
+      - name: Build DMTools from the fork
+        if: inputs.dmtools_fork_repo != '' && steps.dmtools-fork-cache.outputs.cache-hit != 'true'
+        env:
+          FORK_REPO: ${{ inputs.dmtools_fork_repo }}
+          FORK_SHA: ${{ steps.dmtools-fork.outputs.sha }}
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64}"
+          src="${RUNNER_TEMP}/dmtools-src"
+          git clone --depth 1 "https://github.com/${FORK_REPO}.git" "${src}"
+          git -C "${src}" fetch --depth 1 origin "${FORK_SHA}"
+          git -C "${src}" checkout --quiet "${FORK_SHA}"
+          (cd "${src}" && ./gradlew :dmtools-core:shadowJar -x test --no-daemon)
+          mkdir -p ~/.dmtools-fork
+          cp "${src}"/build/libs/dmtools-v*-all.jar ~/.dmtools-fork/dmtools.jar
+
+      - name: Install the DMTools fork jar
+        if: inputs.dmtools_fork_repo != ''
+        run: |
+          mkdir -p ~/.dmtools
+          cp ~/.dmtools-fork/dmtools.jar ~/.dmtools/dmtools.jar
+
+      - name: Configure Git Author
+        run: |
+          git config --global user.name "dm.ai"
+          git config --global user.email "dm.ai@epam.com"
+
+      # The upstream rule file holds every rule of the full loop, merge included. Keep the
+      # ones asked for, in the order of the file, and point the dispatching rules at the
+      # caller's workflow file. A rule id that does not exist is an error, not a silent skip:
+      # an upstream rename must not turn a rule off unnoticed.
+      - name: Select the rules
+        env:
+          SM_RULES: ${{ inputs.sm_rules }}
+          WORKFLOW_FILE: ${{ inputs.workflow_file }}
+        run: |
+          set -euo pipefail
+          keep="$(jq -cn --arg ids "${SM_RULES}" \
+            '$ids | split(",") | map(gsub("\\s"; "")) | map(select(length > 0))')"
+          missing="$(jq -r --argjson keep "${keep}" \
+            '[.params.jobParams.rules[].id] as $have | $keep - $have | join(", ")' agents/sm_github.json)"
+          if [ -n "${missing}" ]; then
+            echo "::error::agents/sm_github.json has no rule with the id: ${missing}"
+            exit 1
+          fi
+          jq --argjson keep "${keep}" --arg wf "${WORKFLOW_FILE}" '
+            .params.jobParams.rules |= (
+              map(select(.id as $i | $keep | index($i)))
+              | map(if has("workflowFile") then .workflowFile = $wf else . end))' \
+            agents/sm_github.json > agents/sm_selected.json
+          echo "rules: $(jq -r '[.params.jobParams.rules[].id] | join(", ")' agents/sm_selected.json)"
+
+      - name: Reconcile the machine loop
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          # Pushes with the token of the workflow trigger no workflows: a branch update does
+          # not start CI. The SM starts the CI of the new head itself.
+          SILENT_GH_TOKEN: ${{ github.token }}
+          DMTOOLS_INTEGRATIONS: "ai,cli,file,github"
+          DEFAULT_TRACKER: "github"
+          CLI_ALLOWED_COMMANDS: "find,ls,cat,mkdir,bash"
+          DRY_RUN: ${{ inputs.dry_run }}
+          MACHINE_AUTHOR: ${{ inputs.machine_author }}
+          CI_WORKFLOW: ${{ inputs.ci_workflow }}
+          MAX_TRIGGERED: ${{ inputs.max_triggered_workflows }}
+        run: |
+          set -euo pipefail
+          export PATH="/home/runner/.local/bin:/home/runner/.dmtools/bin:/home/runner/.npm-global/bin:${PATH}"
+          export SOURCE_GITHUB_WORKSPACE="${GITHUB_REPOSITORY%%/*}"
+          export SOURCE_GITHUB_REPOSITORY="${GITHUB_REPOSITORY#*/}"
+          override="$(jq -cn \
+            --arg repo "${GITHUB_REPOSITORY}" --arg author "${MACHINE_AUTHOR}" \
+            --arg ci "${CI_WORKFLOW}" --arg silent "${SILENT_GH_TOKEN}" --arg source "${PAT_TOKEN}" \
+            --argjson max "${MAX_TRIGGERED}" --argjson dry "${DRY_RUN}" \
+            '{params: {jobParams: ({repo: $repo, machineAuthor: $author, maxTriggeredWorkflows: $max,
+                                    silentToken: $silent, sourceToken: $source}
+               + (if $ci == "" then {} else {ciWorkflow: $ci} end)
+               + (if $dry then {dryRun: true} else {} end))}}')"
+          echo "dry run: ${DRY_RUN}"
+          # The rule file names its script relative to the agents directory.
+          cd agents
+          dmtools --debug run sm_selected.json "${override}"
