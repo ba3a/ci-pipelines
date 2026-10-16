@@ -88,4 +88,4 @@ while read -r repo base java turns tasks author _; do
   else
     echo "    rendered into ${dest}"
   fi
-done < <(tr -d '' < "${root}/repos.conf")
+done < <(tr -d '\r' < "${root}/repos.conf")
