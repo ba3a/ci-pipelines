@@ -189,12 +189,20 @@ jobs:
       # ones asked for, in the order of the file, and point the dispatching rules at the
       # caller's workflow file. A rule id that does not exist is an error, not a silent skip:
       # an upstream rename must not turn a rule off unnoticed.
+      #
+      # The rules dispatch the leg on the branch of the pull request (workflowRef {branch}), so
+      # that GitHub links the run to the pull request. A branch cut before the caller workflow
+      # gained its dispatch inputs holds the old file, and GitHub rejects the inputs with a 422.
+      # Dispatch from the default branch instead: the agent checks out the pull request branch
+      # itself.
       - name: Select the rules
         env:
           SM_RULES: ${{ inputs.sm_rules }}
           WORKFLOW_FILE: ${{ inputs.workflow_file }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
           keep="$(jq -cn --arg ids "${SM_RULES}" \
             '$ids | split(",") | map(gsub("\\s"; "")) | map(select(length > 0))')"
           missing="$(jq -r --argjson keep "${keep}" \
@@ -203,10 +211,11 @@ jobs:
             echo "::error::agents/sm_github.json has no rule with the id: ${missing}"
             exit 1
           fi
-          jq --argjson keep "${keep}" --arg wf "${WORKFLOW_FILE}" '
+          jq --argjson keep "${keep}" --arg wf "${WORKFLOW_FILE}" --arg ref "${default_branch}" '
             .params.jobParams.rules |= (
               map(select(.id as $i | $keep | index($i)))
-              | map(if has("workflowFile") then .workflowFile = $wf else . end))' \
+              | map(if has("workflowFile") then .workflowFile = $wf else . end)
+              | map(if has("workflowRef") then .workflowRef = $ref else . end))' \
             agents/sm_github.json > agents/sm_selected.json
           echo "rules: $(jq -r '[.params.jobParams.rules[].id] | join(", ")' agents/sm_selected.json)"
 
