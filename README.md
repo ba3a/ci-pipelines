@@ -73,6 +73,11 @@ label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_appro
 - **Branches that are behind** are updated by a step of `sm.yml` (`gh pr update-branch` with the
   PAT), not by the upstream rule `silent-update-behind`: that rule runs a shell command DMTools on
   Java refuses and assumes the base branch is `main`.
+- **A failing leg stops itself.** A leg whose agent produced no output (an exhausted API key, the
+  turn cap, a crash) fails red instead of ending green. After `max_failed_runs_per_hour` (default 3)
+  failed runs with the same title, e.g. `rework · gh-5`, within an hour, the next run labels the
+  issue `blocked`, comments once and stops before any setup; the state machine skips blocked items.
+  Fix the cause and remove the label to resume.
 - **CI must be dispatchable.** The tick starts CI on a pull request head itself, so the project's
   `ci.yml` has a `workflow_dispatch` trigger (the template has it).
 - **Rework limits.** The agent rules cap rework by red heads; there is no other cost cap. Watch

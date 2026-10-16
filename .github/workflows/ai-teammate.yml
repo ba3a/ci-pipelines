@@ -56,6 +56,10 @@ on:
         description: 'CLAUDE_CODE_MAX_TURNS'
         type: string
         default: '60'
+      max_failed_runs_per_hour:
+        description: 'Failed runs with the same title (e.g. "rework · gh-5") in the last hour after which the issue is labelled blocked and the leg stops. 0 turns the guard off.'
+        type: string
+        default: '3'
       dmtools_release:
         description: 'DMTools release installed by the agents setup script'
         type: string
@@ -150,6 +154,44 @@ jobs:
             echo "issue=${ISSUE_NUMBER}"
             echo "config=${CONFIG_FILE}"
           } >> "$GITHUB_OUTPUT"
+
+      # A leg that keeps failing (an exhausted API key, a broken setup) must not start again and
+      # again: the state machine dispatches it on every tick while the issue still asks for it,
+      # and every run posts comments. After max_failed_runs_per_hour failed runs with this run's
+      # title in the last hour, label the issue `blocked` (the state machine skips blocked items),
+      # say why once, and stop here, before any expensive setup. Remove the label to resume.
+      - name: Stop a leg that keeps failing
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.run.outputs.issue }}
+          MAX_FAILED: ${{ inputs.max_failed_runs_per_hour }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${MAX_FAILED}" =~ ^[0-9]+$ ]] || [ "${MAX_FAILED}" -eq 0 ]; then
+            echo "Guard off (max_failed_runs_per_hour='${MAX_FAILED}')"
+            exit 0
+          fi
+          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+          title="$(jq -r '.display_title' <<<"${run}")"
+          workflow_id="$(jq -r '.workflow_id' <<<"${run}")"
+          since="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+          failed="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=100&created=%3E%3D${since}" \
+            | jq --arg title "${title}" \
+                '[.workflow_runs[] | select(.display_title == $title and .conclusion == "failure")] | length')"
+          echo "${failed} failed run(s) titled '${title}' in the last hour (limit ${MAX_FAILED})"
+          if [ "${failed}" -lt "${MAX_FAILED}" ]; then
+            exit 0
+          fi
+          labels="$(gh issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json labels --jq '[.labels[].name] | join(",")')"
+          if [[ ",${labels}," != *",blocked,"* ]]; then
+            gh label create blocked --repo "${GITHUB_REPOSITORY}" --color B60205 \
+              --description "Human hold: the machine loop skips this item until the label is removed" 2>/dev/null || true
+            gh issue edit "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label blocked
+            gh issue comment "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body \
+              "The leg \`${title}\` failed ${failed} times in the last hour, so the machine loop stops working on this issue (label \`blocked\`). The failed runs say why, for example an exhausted API key. Fix the cause, then remove the label to resume."
+          fi
+          echo "::error::'${title}' failed ${failed} times in the last hour; issue #${ISSUE_NUMBER} is labelled blocked and this run stops"
+          exit 1
 
       - name: Checkout the project
         uses: actions/checkout@v7
@@ -357,8 +399,20 @@ jobs:
           CLI_ALLOWED_COMMANDS: "find,ls,cat,mkdir,bash"
           ENCODED_CONFIG: ${{ steps.config.outputs.encoded }}
           CONFIG_FILE: ${{ steps.run.outputs.config }}
+        # DMTools reports success even when the agent produced nothing (no outputs/response.md:
+        # an API error, the turn cap, a crash). Such a run did no work, so fail it: the failure is
+        # visible, and the guard above counts it.
         run: |
+          set -o pipefail
           CI_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "Configuration: ${CONFIG_FILE}"
           echo "CI run: ${CI_RUN_URL}"
-          dmtools --debug run "${CONFIG_FILE}" "${ENCODED_CONFIG}" --ciRunUrl "${CI_RUN_URL}"
+          log="${RUNNER_TEMP}/dmtools-run.log"
+          dmtools --debug run "${CONFIG_FILE}" "${ENCODED_CONFIG}" --ciRunUrl "${CI_RUN_URL}" 2>&1 | tee "${log}"
+          if grep -q 'CLI command executed but did not produce output file' "${log}"; then
+            # The agent's own error, when the CLI reported one (stream-json result line).
+            reason="$(grep '"type":"result"' "${log}" | grep '"is_error":true' | tail -n1 \
+              | grep -oE '"result":"[^"]*"|"errors":\["[^"]*"' | head -n1 | sed -E 's/^"(result|errors)":\[?"//; s/"$//' || true)"
+            echo "::error::The agent produced no output, so this leg did nothing${reason:+: ${reason}}"
+            exit 1
+          fi
