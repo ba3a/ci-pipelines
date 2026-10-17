@@ -74,7 +74,8 @@ label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_appro
   PAT), not by the upstream rule `silent-update-behind`: that rule runs a shell command DMTools on
   Java refuses and assumes the base branch is `main`.
 - **A failing leg stops itself.** A leg whose agent produced no output (an exhausted API key, the
-  turn cap, a crash) fails red instead of ending green. After `max_failed_runs_per_hour` (default 3)
+  turn cap, a crash), or whose work the post-action could not commit or push, fails red instead of
+  ending green. After `max_failed_runs_per_hour` (default 3)
   failed runs with the same title, e.g. `rework · gh-5`, within an hour, the next run labels the
   issue `blocked`, comments once and stops before any setup; the state machine skips blocked items.
   Fix the cause and remove the label to resume.

@@ -416,3 +416,20 @@ jobs:
             echo "::error::The agent produced no output, so this leg did nothing${reason:+: ${reason}}"
             exit 1
           fi
+          # The agent can finish its work and the post-action still fail to commit or push it (a
+          # rework that resolved every conflict was lost three times this way). DMTools reports
+          # success, so fail here: the work did not reach the branch, and the guard above must count
+          # it. A post-action may retry and then push after all, so the LAST git outcome decides.
+          lost="$(awk '
+            /Git operations failed|refusing to commit or push/ {
+              failed = 1
+              if ($0 ~ /Git operations failed/ || msg == "") msg = $0
+            }
+            /✅ Pushed to remote branch|✅ Push succeeded after agent fix|✅ Push-only git operations completed successfully/ {
+              failed = 0; msg = ""
+            }
+            END { if (failed) print msg }' "${log}")"
+          if [ -n "${lost}" ]; then
+            echo "::error::The agent's work was not pushed: $(sed -E 's/^[0-9TZ:.-]+ //' <<<"${lost}" | cut -c1-300)"
+            exit 1
+          fi
