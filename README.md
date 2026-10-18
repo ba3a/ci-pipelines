@@ -79,6 +79,9 @@ label dmtools:develop -> dev leg -> pull request -> CI -> review leg -> pr_appro
   failed runs with the same title, e.g. `rework · gh-5`, within an hour, the next run labels the
   issue `blocked`, comments once and stops before any setup; the state machine skips blocked items.
   Fix the cause and remove the label to resume.
+- **No subagents.** The claude-code agent of a leg cannot start subagents (the Agent / Task tool
+  is denied in its settings): a review once fanned out into 22 of them and spent 12 USD. Set
+  `claude_allow_subagents: 'true'` on the caller to allow them.
 - **CI must be dispatchable.** The tick starts CI on a pull request head itself, so the project's
   `ci.yml` has a `workflow_dispatch` trigger (the template has it).
 - **Rework limits.** The agent rules cap rework by red heads; there is no other cost cap. Watch

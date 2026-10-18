@@ -60,6 +60,10 @@ on:
         description: 'Failed runs with the same title (e.g. "rework · gh-5") in the last hour after which the issue is labelled blocked and the leg stops. 0 turns the guard off.'
         type: string
         default: '3'
+      claude_allow_subagents:
+        description: "'true' lets the claude-code agent start subagents (the Agent / Task tool). Off by default: one review fanned out into 22 subagents and spent 12 USD."
+        type: string
+        default: 'false'
       dmtools_release:
         description: 'DMTools release installed by the agents setup script'
         type: string
@@ -344,11 +348,28 @@ jobs:
       # --dangerously-skip-permissions); do the same here. The runner is ephemeral, so scope
       # PAT_TOKEN to the calling repository and rely on branch protection for what the agent
       # may merge.
+      #
+      # Subagents are denied unless claude_allow_subagents is 'true'. A review leg loaded the
+      # built-in code-review skill, which fans out into parallel subagents that fan out again:
+      # 22 subagents, about 10 million cached tokens and 12 USD before the credit ran out. Deny
+      # rules apply in every permission mode, bypassPermissions included; the agent and its skills
+      # then do the work in the main session. Task is the older name of the Agent tool.
       - name: Configure Claude Code permissions
         if: inputs.agent_provider == 'claude-code'
+        env:
+          ALLOW_SUBAGENTS: ${{ inputs.claude_allow_subagents }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.claude
-          echo '{"permissions":{"defaultMode":"bypassPermissions"}}' > ~/.claude/settings.json
+          if [ "${ALLOW_SUBAGENTS}" = "true" ]; then
+            deny='[]'
+          else
+            deny='["Agent", "Task"]'
+          fi
+          jq -n --argjson deny "${deny}" \
+            '{permissions: {defaultMode: "bypassPermissions", deny: $deny}}' > ~/.claude/settings.json
+          echo "Claude Code settings:"
+          cat ~/.claude/settings.json
 
       - name: Build the agent configuration
         id: config
