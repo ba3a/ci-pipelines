@@ -214,11 +214,15 @@ jobs:
             echo "::error::agents/sm_github.json has no rule with the id: ${missing}"
             exit 1
           fi
+          # sm_github.json names its script relative to the agents directory (js/smAgent.js). The
+          # engine runs from the project root, like the legs and like the submodule-layout sm.json
+          # (agents/js/smAgent.js), so prefix the path.
           jq --argjson keep "${keep}" --arg wf "${WORKFLOW_FILE}" --arg ref "${default_branch}" '
             .params.jobParams.rules |= (
               map(select(.id as $i | $keep | index($i)))
               | map(if has("workflowFile") then .workflowFile = $wf else . end)
-              | map(if has("workflowRef") then .workflowRef = $ref else . end))' \
+              | map(if has("workflowRef") then .workflowRef = $ref else . end))
+            | .params.jsPath |= (if startswith("agents/") then . else "agents/" + . end)' \
             agents/sm_github.json > agents/sm_selected.json
           echo "rules: $(jq -r '[.params.jobParams.rules[].id] | join(", ")' agents/sm_selected.json)"
 
@@ -277,25 +281,17 @@ jobs:
           export PATH="/home/runner/.local/bin:/home/runner/.dmtools/bin:/home/runner/.npm-global/bin:${PATH}"
           export SOURCE_GITHUB_WORKSPACE="${GITHUB_REPOSITORY%%/*}"
           export SOURCE_GITHUB_REPOSITORY="${GITHUB_REPOSITORY#*/}"
-          # The engine runs inside agents/, where config discovery finds the agents repository's
-          # own .dmtools/config.js before the project's ../.dmtools/config.js, so the project's
-          # settings (issuePlanning.devLabel, the base branch, ...) were silently ignored. Name the
-          # project's config explicitly; configPath comes first in the discovery order.
-          project_config=""
-          if [ -f .dmtools/config.js ]; then
-            project_config="../.dmtools/config.js"
-          fi
           override="$(jq -cn \
             --arg repo "${GITHUB_REPOSITORY}" --arg author "${MACHINE_AUTHOR}" \
             --arg ci "${CI_WORKFLOW}" --arg silent "${SILENT_GH_TOKEN}" --arg source "${PAT_TOKEN}" \
-            --arg config "${project_config}" \
             --argjson max "${MAX_TRIGGERED}" --argjson dry "${DRY_RUN}" \
             '{params: {jobParams: ({repo: $repo, machineAuthor: $author, maxTriggeredWorkflows: $max,
                                     silentToken: $silent, sourceToken: $source}
                + (if $ci == "" then {} else {ciWorkflow: $ci} end)
-               + (if $config == "" then {} else {configPath: $config} end)
                + (if $dry then {dryRun: true} else {} end))}}')"
-          echo "dry run: ${DRY_RUN}, project config: ${project_config:-none}"
-          # The rule file names its script relative to the agents directory.
-          cd agents
-          dmtools --debug run sm_selected.json "${override}"
+          echo "dry run: ${DRY_RUN}"
+          # Run from the project root so config discovery finds the project's .dmtools/config.js.
+          # Run from agents/, it found the agents repository's own .dmtools/config.js instead, and
+          # the project's file was out of reach: DMTools refuses ../ paths as path traversal. The
+          # project's settings (issuePlanning.devLabel, the base branch, ...) were silently ignored.
+          dmtools --debug run agents/sm_selected.json "${override}"
