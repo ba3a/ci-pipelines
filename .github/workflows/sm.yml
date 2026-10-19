@@ -277,15 +277,25 @@ jobs:
           export PATH="/home/runner/.local/bin:/home/runner/.dmtools/bin:/home/runner/.npm-global/bin:${PATH}"
           export SOURCE_GITHUB_WORKSPACE="${GITHUB_REPOSITORY%%/*}"
           export SOURCE_GITHUB_REPOSITORY="${GITHUB_REPOSITORY#*/}"
+          # The engine runs inside agents/, where config discovery finds the agents repository's
+          # own .dmtools/config.js before the project's ../.dmtools/config.js, so the project's
+          # settings (issuePlanning.devLabel, the base branch, ...) were silently ignored. Name the
+          # project's config explicitly; configPath comes first in the discovery order.
+          project_config=""
+          if [ -f .dmtools/config.js ]; then
+            project_config="../.dmtools/config.js"
+          fi
           override="$(jq -cn \
             --arg repo "${GITHUB_REPOSITORY}" --arg author "${MACHINE_AUTHOR}" \
             --arg ci "${CI_WORKFLOW}" --arg silent "${SILENT_GH_TOKEN}" --arg source "${PAT_TOKEN}" \
+            --arg config "${project_config}" \
             --argjson max "${MAX_TRIGGERED}" --argjson dry "${DRY_RUN}" \
             '{params: {jobParams: ({repo: $repo, machineAuthor: $author, maxTriggeredWorkflows: $max,
                                     silentToken: $silent, sourceToken: $source}
                + (if $ci == "" then {} else {ciWorkflow: $ci} end)
+               + (if $config == "" then {} else {configPath: $config} end)
                + (if $dry then {dryRun: true} else {} end))}}')"
-          echo "dry run: ${DRY_RUN}"
+          echo "dry run: ${DRY_RUN}, project config: ${project_config:-none}"
           # The rule file names its script relative to the agents directory.
           cd agents
           dmtools --debug run sm_selected.json "${override}"
